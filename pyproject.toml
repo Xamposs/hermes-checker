@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-checker"
+version = "0.1.0"
+description = "Local, non-invasive observability for Hermes Agent / Hermes Desktop."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Xamposs" }]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["hermes", "hermes-agent", "observability", "tokens", "profiler", "ai", "llm"]
+dependencies = [
+    # Standard library only by default; FastAPI is optional (see [project.optional-dependencies]).
+    # SQLite ships with Python; pyyaml avoids an extra dep at runtime — we ship our own parser.
+    # tiktoken is optional and only imported when present.
+]
+
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+tokenizers = [
+    "tiktoken>=0.6",
+]
+yaml = [
+    "pyyaml>=6.0",
+]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=4",
+    "ruff>=0.4",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Xamposs/hermes-checker"
+Repository = "https://github.com/Xamposs/hermes-checker"
+Issues = "https://github.com/Xamposs/hermes-checker/issues"
+
+[project.scripts]
+hermes-checker = "hermes_checker.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_checker", "src/hermes_checker/integrations/hermes_plugin"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/hermes_checker",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "config",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src/hermes_checker"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]

@@ -1,0 +1,57 @@
+# Build artifacts
+/build/
+/dist/
+*.egg-info/
+*.egg
+
+# Virtualenvs
+/.venv/
+/venv/
+
+# Byte-compiled / optimized / DLLs
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.ruff_cache/
+
+# Local database (NEVER commit Hermes Checker's own DB)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/.hermes-checker/
+
+# Config secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets.*
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Data dumps from testing
+/data/
+/exports/
+
+# Asar extraction helpers (used only locally to inspect Hermes)
+/asar_tmp/
