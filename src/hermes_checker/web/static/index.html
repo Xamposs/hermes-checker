@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Hermes Checker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header>
+  <h1>Hermes Checker</h1>
+  <nav>
+    <button data-view="live" class="active">Live</button>
+    <button data-view="session">Session</button>
+    <button data-view="analytics">Analytics</button>
+    <button data-view="insights">Insights</button>
+  </nav>
+</header>
+
+<main id="content">
+  <p class="hint">Loading…</p>
+</main>
+
+<footer>
+  <span id="health">…</span>
+  <span class="dot">·</span>
+  <span>Local dashboard · bound to <code>127.0.0.1</code></span>
+</footer>
+
+<template id="tmpl-live">
+  <section>
+    <h2>Current session</h2>
+    <div id="live-meta"></div>
+    <h3>Totals</h3>
+    <div id="live-totals"></div>
+    <h3>Last 10 events</h3>
+    <pre id="live-events"></pre>
+  </section>
+</template>
+
+<template id="tmpl-sessions">
+  <section>
+    <h2>Sessions</h2>
+    <ul id="session-list"></ul>
+  </section>
+</template>
+
+<template id="tmpl-session-detail">
+  <section>
+    <h2>Session <span id="session-id"></span></h2>
+    <div id="session-meta"></div>
+    <h3>Totals</h3>
+    <div id="session-totals"></div>
+    <h3>API requests</h3>
+    <table id="session-requests">
+      <thead><tr>
+        <th>Time</th><th>Model</th><th>Provider</th>
+        <th>Prompt</th><th>Cached</th><th>Output</th>
+        <th>TTFT</th><th>TPS</th><th>Cache hit</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <h3>Component attribution</h3>
+    <table id="session-components">
+      <thead><tr><th>Component</th><th>Tokens</th><th>Method</th><th>Confidence</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h3>Tool calls</h3>
+    <table id="session-tools">
+      <thead><tr>
+        <th>Time</th><th>Tool</th><th>Category</th>
+        <th>Duration ms</th><th>Status</th><th>Output chars</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</template>
+
+<template id="tmpl-analytics">
+  <section>
+    <h2>Analytics</h2>
+    <label>Window
+      <select id="window-select">
+        <option value="1d">Last 24h</option>
+        <option value="7d" selected>Last 7 days</option>
+        <option value="30d">Last 30 days</option>
+        <option value="all">All time</option>
+      </select>
+    </label>
+    <div id="analytics-output"></div>
+  </section>
+</template>
+
+<template id="tmpl-insights">
+  <section>
+    <h2>Insights</h2>
+    <ul id="insights-list"></ul>
+  </section>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
