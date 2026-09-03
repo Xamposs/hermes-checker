@@ -68,4 +68,5 @@ def test_report_round_trip(tmp_path: Path) -> None:
     assert report.totals.output_tokens == 200
     assert report.totals.reasoning_tokens == 50
     assert any(c.component == "SYSTEM" for c in report.component_breakdown)
-    assert any(t.category == "terminal" for t in report.tool_breakdown)
+    # Command-aware classification (Issue 9) upgrades "pytest" to "test".
+    assert any(t.category in ("test", "terminal") for t in report.tool_breakdown)
