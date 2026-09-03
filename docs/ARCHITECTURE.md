@@ -203,3 +203,59 @@ re-implement the hook system or parse logs.
   commits, so the hook callback never blocks on the analyzer.
 - The dashboard uses a read-only connection and never writes, so
   there's no lock contention.
+## V1.1 changes (this revision)
+
+- The collector gains a hermes_checker.hermes_native bridge that
+  invokes Hermes's own offline prompt-size machinery either in-process
+  (when running inside Hermes's venv) or via a short-lived subprocess
+  (otherwise). The bridge is what backs hermes-checker snapshot.
+- ccounting.attribution.attribute_messages now does
+  **section-aware** splitting of the role=system message (tools,
+  skills, memory, user_profile, project instructions, MCP, subagents)
+  by header detection and conservative content-shape checks; the
+  whole message is upgraded from SYSTEM to the matching component
+  when one of the cheap recognisers fires.
+- The 	ool_calls table now carries command_family,
+  command_hash, input_measurement_method, output_measurement_method,
+  input_tokens, rgs_keys_json, path_ext, path_hash,
+  path_basename, ile_path_stored. classify_tool(name, args) is
+  command-aware: a pytest invocation lands in 	est, a
+  git diff in git, an 
+pm run build in uild, etc.
+- post_api_request populates prompt_visible_chars,
+  prompt_visible_provenance, prompt_visible_tokens_est,
+  prompt_visible_confidence, payload_truncated,
+  weight_cached, weight_prompt. The collector detects the
+  _sanitize_hook_payload truncation sentinel and suppresses
+  attribution for that request.
+- A new context_deltas table holds the LOCALLY_ATTRIBUTED delta
+  between consecutive API requests: provider delta, explained sum,
+  unexplained gap, coverage fraction, and a per-component contributors
+  list. The collector fills this in whenever post_api_request is
+  called with a non-truncated payload.
+- A new pp_config key-value table backs the persistent experiment
+  label. The hermes-checker experiment set|show|clear subcommands
+  read/write it. The collector reads experiment on every session
+  start.
+- A new skill_events table logs every on_skill_lifecycle payload
+  (action, skill_name, use_count, reused, reuse_after_patch).
+- A new self_overhead_samples table lets the collector time its own
+  callbacks. The HookCollector._record_self_overhead and
+  HookCollector._timed helpers surface a >50ms warning when an
+  observer callback becomes a perf problem.
+- The report layer (eporting.py) now exposes the
+  SessionReport.by_provider_model and
+  SessionReport.by_context_bucket lists plus P50/P95 percentiles
+  for latency, TTFT, and TPS. The token-weighted session cache hit
+  ratio (cache_hit_ratio_weighted) is the primary metric; the
+  unweighted mean is kept for comparison.
+- A new hermes-checker snapshot CLI subcommand persists the static
+  prompt breakdown to static_prompt_snapshots plus
+  static_skill_breakdowns and static_toolset_breakdowns rows.
+- A new hermes-checker experiment CLI subcommand set/show/clear
+  backs the persistent experiment label.
+- hermes-checker doctor was hardened. Each check is on its own line
+  with [PASS] / [FAIL] / [WARN] / [SKIP], and the "real PluginManager
+  discovers plugin" check actually spawns Hermes's Python and runs
+  _discover_and_load_inner on a real sandbox home, with no substring
+  searching of config.yaml for the substring "hermes-checker".

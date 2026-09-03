@@ -268,3 +268,105 @@ build, hooks disabled, plugin not loaded), the doctor command reports
 the situation and prints a manual recovery. We do NOT implement a
 secondary passive observer in V1 because it would either re-implement
 hook firing or parse logs â€” both are invasive in different ways.
+## 11. V1.1 Additions (this revision)
+
+The V1.1 hardening pass addresses the code-review findings. It does
+**not** change any of the core architecture above; it only makes the
+integration more honest and more testable.
+
+### Hermes-native prompt breakdown (Issue 5)
+
+Hermes ships an offline prompt-size machinery in
+hermes_cli.prompt_size.compute_prompt_breakdown(platform='cli').
+The function takes no LLM, opens no network connection, builds an
+AIAgent with pi_key='inspect-only', calls the same
+uild_system_prompt_parts and uild_system_prompt the agent
+itself uses, and returns a per-tier + per-component token breakdown.
+
+Hermes Checker V1.1 wraps that machinery in
+hermes_checker.hermes_native.HermesNativeBridge. The wrapper:
+
+1. Tries to import hermes_cli.prompt_size directly (works when the
+   user runs Hermes Checker inside Hermes's venv).
+2. Otherwise, spawns the Hermes-Venv Python (<hermes-home>/hermes-agent/venv/Scripts/python.exe)
+   as a subprocess and runs the same function there. The subprocess
+   contract is offline; no LLM, no network.
+3. Falls back to a local-only chars/4 estimate when neither path
+   is available.
+
+hermes-checker snapshot is a one-shot operator command — the result
+is persisted as one static_prompt_snapshots row plus per-skill
+static_skill_breakdowns and per-toolset static_toolset_breakdowns
+rows. Subsequent API requests can be joined to the snapshot id so
+the dashboard can show "system: 3,415t, tools: 8,475t, …" with
+provenance HERMES_NATIVE_ESTIMATE instead of a local estimate.
+
+### Payload truncation handling (Issue 8)
+
+The _truncated sentinel from _sanitize_hook_payload is detected
+on every post_api_request. The collector stores
+pi_requests.payload_truncated = 1, drops the
+prompt_visible_confidence to  .4, and SKIPS attribution for the
+request. The un-attributed gap (provider prompt - local sum) is
+surfaced in the report as ttribution_error_tokens and the
+explicit Coverage: X% line.
+
+### Persistent experiment labels (Issue 16)
+
+V1.0 read the experiment from HERMES_CHECKER_EXPERIMENT. V1.1 adds
+a persistent pp_config key-value table in SQLite so the label
+survives across Hermes Desktop restarts. The hermes-checker
+experiment set/show/clear subcommands write to this table; the
+collector reads it at session-start and stamps every row.
+
+### Weighted cache hit (Issue 13)
+
+V1.0 reported the unweighted mean of per-request cache ratios. V1.1
+adds the **token-weighted** session ratio (sum(cache_read) /
+sum(prompt)) and labels both. OpenRouter workloads routinely show
+~90% weighted; the unweighted mean can be misleading on a workload
+where one request had 100% and the rest had 0%.
+
+### P50/P95 percentiles and per-(provider, model) breakdown (Issue 14)
+
+The report now includes P50 / P95 percentiles for latency, TTFT, and
+TPS, and a per-(provider, model) breakdown plus a per-context-size
+breakdown (0-32k, 32-64k, 64-128k, 128-256k, 256-512k, 512k+). This
+is the data that supports "Provider X is cheap but drops to 17 TPS at
+300k context" comparisons.
+
+### Context-delta attribution (Issue 12)
+
+For every consecutive (previous, current) API request pair in the
+same session, the collector writes a context_deltas row with the
+provider delta, the locally-explained sum, the coverage fraction,
+and a per-component contributors list (in JSON). This is the
+"what grew the prompt by 27k tokens? terminal +15.6k, file read
++10.2k, …" view in the report.
+
+### Command-aware tool classification (Issue 9)
+
+	erminal no longer means "the user ran a generic shell command."
+A 	erminal call whose command starts with pytest, 
+pm test,
+go test, … is classified as 	est; one starting with git is
+classified as git; one starting with 	sc, 
+pm run build,
+make is uild; one starting with g, grep, d is search;
+one starting with uff, mypy, eslint is lint; one starting
+with pip install, 
+pm install, docker pull is package.
+
+We never write the full command string; we store only the
+SHA256-hashed command, the one-word command family
+(pytest, 
+pm, git, …), and the top-level arg keys.
+
+### Schema v2 + v3 migrations
+
+The database version goes from 1 (V1) to 2 (V1.1) to 3 (V1.1
+follow-up). Every column lands in a new migration; old rows are
+never rewritten. V1 databases open cleanly under the V1.1 collector
+and are auto-upgraded in place. V3 adds the provenance column
+to prompt_components so we can distinguish
+HERMES_NATIVE_ESTIMATE from LOCALLY_ESTIMATED without recomputing.

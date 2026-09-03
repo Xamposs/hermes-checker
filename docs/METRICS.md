@@ -162,3 +162,109 @@ of Hermes's own redaction). The patterns we look for:
 - `api_key=value` (case-insensitive)
 
 Replacements are always `<redacted>`. We do not log redactions.
+## V1.1 additions
+
+Six provenance labels, not five. The new one is
+**HERMES_NATIVE_ESTIMATE**, used for numbers produced by Hermes's
+own offline machinery (currently compute_prompt_breakdown).
+
+### Token-weighted session cache hit (Issue 13)
+
+Both ratios are reported, clearly labelled:
+
+- cache_hit_ratio_weighted — primary metric:
+  `sum(cache_read_tokens) / sum(prompt_tokens)` over the session.
+- cache_hit_ratio_mean — kept for comparison: arithmetic mean of
+  per-request ratios.
+
+### P50 / P95 percentiles (Issue 14)
+
+The report and dashboard now show `avg / p50 / p95` for:
+
+- request latency
+- time-to-first-token (when streaming)
+- tokens-per-second output (when streaming)
+
+### Per-(provider, model) and per-context-size breakdown (Issue 14)
+
+The session view has two new tables:
+
+- **by (provider, model)** — one row per provider+model seen in
+  the session: request count, avg latency, avg TTFT, avg TPS,
+  avg cache-hit, total prompt, total output.
+- **by context-size bucket** — one row per 0-32k / 32-64k / 64-128k
+  / 128-256k / 256-512k / 512k+ bucket.
+
+### LOCALLY_ATTRIBUTED_CONTEXT_DELTA (Issue 12)
+
+context_deltas rows are written between consecutive API requests
+in the same session. Each row carries:
+
+- previous_api_request_id, current_api_request_id
+- provider_delta_tokens (provider_prompt - previous_prompt)
+- explained_tokens (sum of per-component changes)
+- unexplained_tokens (provider_delta - explained)
+- coverage (explained / provider_delta, 0..1)
+- contributors_json — list of `{component, tokens}` in
+  descending order (top 20).
+
+### Prompt truncation (Issue 8)
+
+pi_requests.payload_truncated is 1 when Hermes replaced the
+hook payload with the _truncated sentinel. The collector sets
+prompt_visible_confidence = 0.4 and skips attribution for that
+request. The report surfaces this explicitly so the un-attributed
+gap is not hidden.
+
+### Static prompt snapshot (Issue 6)
+
+hermes-checker snapshot runs Hermes's own
+compute_prompt_breakdown(platform='cli') and persists the result
+to static_prompt_snapshots (one row), static_skill_breakdowns
+(per-skill index-line + SKILL.md token estimates), and
+static_toolset_breakdowns (per-toolset schema token estimates).
+The snapshot is then joinable to subsequent API requests via
+pi_requests.context_tier_snapshot_id so the dashboard can
+show fixed-overhead numbers with HERMES_NATIVE_ESTIMATE
+provenance.
+
+### Persistent experiment label (Issue 16)
+
+hermes-checker experiment set <name> writes to the pp_config
+table. The collector reads it on every session start. The
+hermes-checker experiment show / clear subcommands round-trip
+the value.
+
+### Tool call sanitization (Issue 11)
+
+	ool_calls no longer stores the raw command line or path. We
+persist:
+
+- command_family — the first token of the command
+  (pytest, 
+pm, git, …) with pnpm/yarn/bun folded to npm.
+- command_hash — SHA256 of the canonicalised command (stable
+  identifier; not reversible).
+- input_tokens / input_tokens_est / input_measurement_method
+  — tokenised with the same tokenizer as the rest of the system.
+- path_basename, path_ext, path_hash — only the basename and
+  extension are kept; the full path is not.
+- rgs_keys_json — list of top-level arg keys, no values.
+- rgs_hash — SHA256 of the JSON-serialised args dict, no plaintext.
+
+### Command-aware tool classification (Issue 9)
+
+classify_tool(name, args) returns one of:
+ile_read / file_write / search / terminal / test / build /
+git / lint / web / mcp / memory / skill / package / other.
+For terminal-shaped tool names, the args' command / cmd /
+shell_command / rgv / rgs is inspected and the bucket is
+upgraded (e.g. pytest ? 	est, git diff ? git,
+	sc ? uild, g ? search, pip install ? package).
+
+### Self-overhead tracking (Issue 19)
+
+HookCollector._record_self_overhead(callback_name, started_at) writes
+one self_overhead_samples row per callback invocation. A
+>50ms callback fires a logger warning so a slow observer is
+visible without spinning up a profiler.
