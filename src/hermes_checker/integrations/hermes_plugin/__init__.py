@@ -88,6 +88,14 @@ def register(ctx: Any) -> None:
     ctx.register_hook("on_session_start", safe("on_session_start"))
     ctx.register_hook("on_session_end", safe("on_session_end"))
     ctx.register_hook("on_session_finalize", safe("on_session_finalize"))
+    ctx.register_hook("on_session_reset", safe("on_session_reset"))
+
+    # Skill lifecycle
+    ctx.register_hook("on_skill_lifecycle", safe("on_skill_lifecycle"))
+
+    # Subagent lifecycle
+    ctx.register_hook("subagent_start", safe("subagent_start"))
+    ctx.register_hook("subagent_stop", safe("subagent_stop"))
 
     # LLM / API requests
     ctx.register_hook("pre_api_request", safe("pre_api_request"))
@@ -95,6 +103,9 @@ def register(ctx: Any) -> None:
     ctx.register_hook("api_request_error", safe("api_request_error"))
     # The pre/post_llm_call hooks carry per-turn context too — useful
     # as a backup correlation signal if the api_* hooks are unavailable.
+    # Our handlers are PASSIVE observers; they always return None so we
+    # never inject context (the spec's "observer callbacks MUST NOT
+    # inject context" rule).
     ctx.register_hook("pre_llm_call", safe("pre_llm_call"))
     ctx.register_hook("post_llm_call", safe("post_llm_call"))
 
