@@ -252,6 +252,144 @@ def build_app(
             "findings": [f.__dict__ for f in findings],
         }
 
+    @app.get("/api/sessions/{session_id}/report")
+    def session_report(session_id: str,
+                      pricing_file: Optional[str] = None,
+                      profile: Optional[str] = None) -> dict[str, Any]:
+        """Full :class:`SessionReport` for one session (V1.1 view).
+
+        Includes the per-component attribution, the per-tool breakdown,
+        the per-(provider, model) performance breakdown, the per-context-
+        size bucket breakdown, the locally-attributed context deltas
+        between consecutive API requests, and the projected cost (when
+        a pricing profile is supplied).
+        """
+        if not database.session(session_id):
+            raise HTTPException(404, "Unknown session")
+        from hermes_checker.reporting import build_report
+        pricing = None
+        if pricing_file:
+            from pathlib import Path
+            from hermes_checker.accounting import load_pricing_profile
+            try:
+                table = load_pricing_profile(Path(pricing_file))
+                pricing = {"default": table}
+            except Exception as exc:
+                raise HTTPException(400, f"Failed to load pricing file: {exc}")
+        report = build_report(database, session_id, pricing=pricing, profile_name=profile)
+        return {
+            "session_id": report.session_id,
+            "profile": report.profile,
+            "platform": report.platform,
+            "started_at": report.started_at,
+            "ended_at": report.ended_at,
+            "experiment": report.experiment,
+            "totals": _serialize_totals(report.totals),
+            "component_breakdown": [
+                {
+                    "component": c.component,
+                    "estimated_tokens": c.estimated_tokens,
+                    "percentage": c.percentage,
+                    "measurement_method": c.measurement_method,
+                    "confidence": c.confidence,
+                    "provenance": c.provenance,
+                }
+                for c in report.component_breakdown
+            ],
+            "tool_breakdown": [
+                {
+                    "category": t.category,
+                    "calls": t.calls,
+                    "estimated_output_tokens": t.estimated_output_tokens,
+                    "percentage_of_calls": t.percentage_of_calls,
+                    "command_family": t.command_family,
+                }
+                for t in report.tool_breakdown
+            ],
+            "by_provider_model": [
+                {
+                    "provider": b.provider,
+                    "model": b.model,
+                    "requests": b.requests,
+                    "avg_ttft_s": b.avg_ttft_s,
+                    "avg_tps": b.avg_tps,
+                    "avg_latency_s": b.avg_latency_s,
+                    "cache_hit_ratio": b.cache_hit_ratio,
+                    "total_prompt_tokens": b.total_prompt_tokens,
+                    "total_output_tokens": b.total_output_tokens,
+                }
+                for b in report.by_provider_model
+            ],
+            "by_context_bucket": [
+                {
+                    "label": b.label,
+                    "request_count": b.request_count,
+                    "avg_latency_s": b.avg_latency_s,
+                    "avg_tps": b.avg_tps,
+                    "cache_hit_ratio": b.cache_hit_ratio,
+                }
+                for b in report.by_context_bucket
+            ],
+            "context_deltas": [
+                {
+                    "session_id": d["session_id"],
+                    "previous_api_request_id": d["previous_api_request_id"],
+                    "current_api_request_id": d["current_api_request_id"],
+                    "provider_delta_tokens": d["provider_delta_tokens"],
+                    "explained_tokens": d["explained_tokens"],
+                    "unexplained_tokens": d["unexplained_tokens"],
+                    "coverage": d["coverage"],
+                    "contributors": _safe_json(d["contributors_json"]) or [],
+                    "detected_at": d["detected_at"],
+                    "confidence": d["confidence"],
+                }
+                for d in report.context_deltas
+            ],
+            "attribution_coverage": report.attribution_coverage,
+            "attribution_error_tokens": report.attribution_error_tokens,
+            "truncated_payloads": report.truncated_payloads,
+            "skill_events_count": report.skill_events_count,
+            "findings": report.findings,
+            "provenance_notes": report.provenance_notes,
+        }
+
+    @app.get("/api/sessions/{session_id}/snapshots")
+    def session_snapshots(session_id: str) -> dict[str, Any]:
+        """Latest static prompt snapshot for the session (or globally)."""
+        snap = database.latest_snapshot()
+        if snap is None:
+            return {"session_id": session_id, "snapshot": None}
+        return {
+            "session_id": session_id,
+            "snapshot": {
+                "id": snap["id"],
+                "taken_at": snap["taken_at"],
+                "hermes_version": snap["hermes_version"],
+                "platform": snap["platform"],
+                "model": snap["model"],
+                "system_prompt_tokens_est": snap["system_prompt_tokens_est"],
+                "stable_tokens_est": snap["stable_tokens_est"],
+                "context_tokens_est": snap["context_tokens_est"],
+                "volatile_tokens_est": snap["volatile_tokens_est"],
+                "skills_index_tokens_est": snap["skills_index_tokens_est"],
+                "memory_tokens_est": snap["memory_tokens_est"],
+                "user_profile_tokens_est": snap["user_profile_tokens_est"],
+                "tools_json_tokens_est": snap["tools_json_tokens_est"],
+                "mcp_schemas_tokens_est": snap["mcp_schemas_tokens_est"],
+                "subagent_defs_tokens_est": snap["subagent_defs_tokens_est"],
+                "hermes_native": bool(snap["hermes_native"]),
+                "tokenizer_method": snap["tokenizer_method"],
+            },
+        }
+
+    @app.get("/api/sessions/{session_id}/skill-events")
+    def session_skill_events(session_id: str) -> dict[str, Any]:
+        events = database.skill_events_for_session(session_id)
+        return {
+            "session_id": session_id,
+            "events": [dict(r) for r in events],
+        }
+
     @app.get("/api/pricing")
     def pricing_list() -> dict[str, Any]:
         rows = database.pricing()
@@ -348,15 +486,49 @@ def _totals_from_rows(requests: list[dict[str, Any]]) -> dict[str, Any]:
     reasoning = sum(r["reasoning_tokens"] or 0 for r in requests)
     total = sum(r["total_tokens"] or 0 for r in requests)
     ratios = [r["cache_hit_ratio"] for r in requests if r["cache_hit_ratio"] is not None]
+    weighted = (sum(r["weight_cached"] or 0 for r in requests) / prompt) if prompt else None
     return {
         "api_requests": len(requests),
         "prompt_tokens": prompt,
         "cached_tokens": cached,
         "fresh_tokens": max(0, prompt - cached),
         "cache_hit_ratio": (sum(ratios) / len(ratios)) if ratios else None,
+        "cache_hit_ratio_weighted": weighted,
         "output_tokens": output,
         "reasoning_tokens": reasoning,
         "total_tokens": total,
+    }
+
+
+def _serialize_totals(t: Any) -> dict[str, Any]:
+    """Turn a :class:`SessionTotals` into a JSON-friendly dict."""
+    return {
+        "api_requests": t.api_requests,
+        "tool_calls": t.tool_calls,
+        "prompt_tokens": t.prompt_tokens,
+        "input_tokens": t.input_tokens,
+        "output_tokens": t.output_tokens,
+        "reasoning_tokens": t.reasoning_tokens,
+        "cache_read_tokens": t.cache_read_tokens,
+        "cache_write_tokens": t.cache_write_tokens,
+        "fresh_tokens": t.fresh_tokens,
+        "total_tokens": t.total_tokens,
+        "duration_s_total": t.duration_s_total,
+        "duration_s_api_avg": t.duration_s_api_avg,
+        "duration_s_p50": t.duration_s_p50,
+        "duration_s_p95": t.duration_s_p95,
+        "ttft_s_avg": t.ttft_s_avg,
+        "ttft_s_p50": t.ttft_s_p50,
+        "ttft_s_p95": t.ttft_s_p95,
+        "tps_avg": t.tps_avg,
+        "tps_p50": t.tps_p50,
+        "tps_p95": t.tps_p95,
+        "cache_hit_ratio_mean": t.cache_hit_ratio_mean,
+        "cache_hit_ratio_weighted": t.cache_hit_ratio_weighted,
+        "provider_cost_usd": t.provider_cost_usd,
+        "projected_cost_usd": t.projected_cost_usd,
+        "projected_cost_profile": t.projected_cost_profile,
+        "streaming_requests": t.streaming_requests,
     }
 
 
