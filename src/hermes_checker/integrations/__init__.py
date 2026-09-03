@@ -1,12 +1,10 @@
-"""Hermes plugin package — the user-plugin shim Hermes Agent loads.
+"""Hermes Checker integration package.
 
-This module lives in :mod:`hermes_checker.integrations.hermes_plugin` and
-is shipped to the user's Hermes plugins directory by the
+The actual user plugin that Hermes Agent loads lives in
+:mod:`hermes_checker.integrations.hermes_plugin` — that is what gets
+copied into ``~/.hermes/plugins/hermes-checker/`` by the
 ``hermes-checker install`` CLI subcommand.
 
-The plugin keeps ZERO non-stdlib runtime dependencies so it can load
-inside Hermes without polluting its environment.
+This top-level package is here so we can import integration helpers
+from the Hermes Checker Python package (e.g. for the dashboard).
 """
-from .plugin import register
-
-__all__ = ["register"]

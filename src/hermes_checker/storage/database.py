@@ -1,18 +1,21 @@
 """SQLite-backed persistence for Hermes Checker.
 
-The :class:`Database` class is intentionally tiny: a thin wrapper around
-``sqlite3.Connection`` that applies migrations on open and exposes typed
-write methods for the data the collector emits.
+The :class:`Database` class is a thin wrapper around ``sqlite3.Connection``
+that applies migrations on open and exposes typed writer methods for the
+data the collector emits.
 
 Design notes
 ------------
 
 - All public write methods commit individually. The collector writes one
   row per Hermes event; coalescing would force the dashboard to query
-  intermediate state and is not worth the complexity in V1.
+  intermediate state and is not worth the complexity in V1.1.
 - WAL mode is enabled so the dashboard can read concurrently while the
   collector writes.
 - Foreign keys are enforced; the schema relies on this.
+- Provenance tags are stored as text columns so the dashboard can
+  surface them. The :class:`Database` itself never inspects or
+  overwrites a value's provenance label — the caller decides.
 """
 from __future__ import annotations
 
@@ -56,17 +59,15 @@ class DatabasePaths:
 class Database:
     """Single-process wrapper around a SQLite file.
 
-    The instance is thread-safe via an internal lock around writes; reads
-    are unlocked because ``sqlite3`` connections are not safe to share
-    across threads without ``check_same_thread=False`` and even then we
-    keep it simple.  The dashboard opens its own read-only connection.
+    Thread-safe via an internal write lock; reads are unlocked because
+    sqlite3 connections are not safe to share across threads without
+    ``check_same_thread=False`` and even then we keep it simple.  The
+    dashboard opens its own read-only connection.
     """
 
     def __init__(self, paths: DatabasePaths, *, readonly: bool = False) -> None:
         self.paths = paths
         self.readonly = readonly
-        # ``check_same_thread=False`` so FastAPI workers (when added) can
-        # share; we still guard writes with a lock.
         self._conn = sqlite3.connect(
             str(paths.database),
             check_same_thread=False,
@@ -212,8 +213,9 @@ class Database:
 
         The dict MUST contain every column we plan to write. The caller
         (the collector) is responsible for computing derived columns
-        (duration_s, ttft_s, tokens_per_second, cache_hit_ratio) and for
-        picking the right provenance label per bucket.
+        (duration_s, ttft_s, tokens_per_second, cache_hit_ratio,
+        context_tier_snapshot_id) and for picking the right provenance
+        label per bucket.
         """
         with self._write_lock:
             cur = self._conn.execute(
@@ -234,6 +236,10 @@ class Database:
                     raw_usage_json,
                     assistant_content_chars, assistant_tool_call_count,
                     request_hash, response_hash,
+                    prompt_visible_chars, prompt_visible_provenance,
+                    prompt_visible_tokens_est, prompt_visible_confidence,
+                    payload_truncated, weight_cached, weight_prompt,
+                    context_tier_snapshot_id,
                     metadata_json
                 ) VALUES (
                     :session_id, :turn_id, :api_request_id, :api_call_count,
@@ -251,6 +257,10 @@ class Database:
                     :raw_usage_json,
                     :assistant_content_chars, :assistant_tool_call_count,
                     :request_hash, :response_hash,
+                    :prompt_visible_chars, :prompt_visible_provenance,
+                    :prompt_visible_tokens_est, :prompt_visible_confidence,
+                    :payload_truncated, :weight_cached, :weight_prompt,
+                    :context_tier_snapshot_id,
                     :metadata_json
                 )
                 """,
@@ -273,8 +283,8 @@ class Database:
                     INSERT INTO prompt_components (
                         api_request_row_id, component, characters, bytes,
                         estimated_tokens, measurement_method, confidence,
-                        source_identifier
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        source_identifier, provenance
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         api_request_row_id,
@@ -285,6 +295,7 @@ class Database:
                         c["measurement_method"],
                         float(c["confidence"]),
                         c.get("source_identifier"),
+                        c.get("provenance", "LOCALLY_ESTIMATED"),
                     ),
                 )
                 ids.append(cur.lastrowid or 0)
@@ -307,7 +318,11 @@ class Database:
                     output_truncated,
                     input_chars, input_tokens_est,
                     output_chars, output_tokens_est,
-                    output_hash, args_hash, args_summary, metadata_json
+                    output_hash, args_hash, args_summary, metadata_json,
+                    command_family, command_hash,
+                    input_measurement_method, output_measurement_method,
+                    input_tokens, args_keys_json,
+                    path_ext, path_hash, path_basename, file_path_stored
                 ) VALUES (
                     :session_id, :turn_id, :api_request_row_id,
                     :tool_call_id, :tool_name, :category,
@@ -316,13 +331,27 @@ class Database:
                     :output_truncated,
                     :input_chars, :input_tokens_est,
                     :output_chars, :output_tokens_est,
-                    :output_hash, :args_hash, :args_summary, :metadata_json
+                    :output_hash, :args_hash, :args_summary, :metadata_json,
+                    :command_family, :command_hash,
+                    :input_measurement_method, :output_measurement_method,
+                    :input_tokens, :args_keys_json,
+                    :path_ext, :path_hash, :path_basename, :file_path_stored
                 )
                 """,
                 _tool_call_bind(row),
             )
             self._conn.commit()
             return cur.lastrowid or 0
+
+    def update_tool_call_api_request(self, tool_call_row_id: int,
+                                     api_request_row_id: int) -> None:
+        """Backfill the api_request_row_id of a tool call we correlated later."""
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE tool_calls SET api_request_row_id=? WHERE id=?",
+                (api_request_row_id, tool_call_row_id),
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Events
@@ -392,6 +421,280 @@ class Database:
             )
             self._conn.commit()
             return cur.lastrowid or 0
+
+    # ------------------------------------------------------------------
+    # Static prompt snapshots (V1.1)
+    # ------------------------------------------------------------------
+
+    def insert_static_snapshot(
+        self,
+        row: dict[str, Any],
+        *,
+        skills: Iterable[dict[str, Any]] = (),
+        toolsets: Iterable[dict[str, Any]] = (),
+    ) -> int:
+        with self._write_lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO static_prompt_snapshots (
+                    taken_at, hermes_version, platform, model, base_url,
+                    system_prompt_chars, system_prompt_bytes, system_prompt_tokens_est,
+                    stable_chars, stable_bytes, stable_tokens_est,
+                    context_chars, context_bytes, context_tokens_est,
+                    volatile_chars, volatile_bytes, volatile_tokens_est,
+                    skills_index_chars, skills_index_bytes, skills_index_tokens_est,
+                    memory_chars, memory_bytes, memory_tokens_est,
+                    user_profile_chars, user_profile_bytes, user_profile_tokens_est,
+                    tools_count, tools_json_bytes, tools_json_tokens_est,
+                    mcp_schemas_chars, mcp_schemas_bytes, mcp_schemas_tokens_est,
+                    subagent_defs_chars, subagent_defs_bytes, subagent_defs_tokens_est,
+                    other_chars, other_bytes, other_tokens_est,
+                    tokenizer_method, hermes_native, metadata_json
+                ) VALUES (
+                    :taken_at, :hermes_version, :platform, :model, :base_url,
+                    :system_prompt_chars, :system_prompt_bytes, :system_prompt_tokens_est,
+                    :stable_chars, :stable_bytes, :stable_tokens_est,
+                    :context_chars, :context_bytes, :context_tokens_est,
+                    :volatile_chars, :volatile_bytes, :volatile_tokens_est,
+                    :skills_index_chars, :skills_index_bytes, :skills_index_tokens_est,
+                    :memory_chars, :memory_bytes, :memory_tokens_est,
+                    :user_profile_chars, :user_profile_bytes, :user_profile_tokens_est,
+                    :tools_count, :tools_json_bytes, :tools_json_tokens_est,
+                    :mcp_schemas_chars, :mcp_schemas_bytes, :mcp_schemas_tokens_est,
+                    :subagent_defs_chars, :subagent_defs_bytes, :subagent_defs_tokens_est,
+                    :other_chars, :other_bytes, :other_tokens_est,
+                    :tokenizer_method, :hermes_native, :metadata_json
+                )
+                """,
+                _snapshot_bind(row),
+            )
+            sid = cur.lastrowid or 0
+            for s in skills:
+                self._conn.execute(
+                    """
+                    INSERT INTO static_skill_breakdowns (
+                        snapshot_id, skill_name, index_line_chars, index_line_bytes,
+                        index_line_tokens_est, skill_md_chars, skill_md_bytes,
+                        skill_md_tokens_est, rank_in_index
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sid,
+                        s["skill_name"],
+                        s.get("index_line_chars"),
+                        s.get("index_line_bytes"),
+                        s.get("index_line_tokens_est"),
+                        s.get("skill_md_chars"),
+                        s.get("skill_md_bytes"),
+                        s.get("skill_md_tokens_est"),
+                        s.get("rank_in_index"),
+                    ),
+                )
+            for t in toolsets:
+                self._conn.execute(
+                    """
+                    INSERT INTO static_toolset_breakdowns (
+                        snapshot_id, toolset_name, tool_count, schema_chars,
+                        schema_bytes, schema_tokens_est
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sid,
+                        t["toolset_name"],
+                        t.get("tool_count"),
+                        t.get("schema_chars"),
+                        t.get("schema_bytes"),
+                        t.get("schema_tokens_est"),
+                    ),
+                )
+            self._conn.commit()
+            return sid
+
+    def latest_snapshot(self, model: Optional[str] = None) -> Optional[sqlite3.Row]:
+        if model:
+            return self._conn.execute(
+                "SELECT * FROM static_prompt_snapshots WHERE model=? "
+                "ORDER BY taken_at DESC LIMIT 1",
+                (model,),
+            ).fetchone()
+        return self._conn.execute(
+            "SELECT * FROM static_prompt_snapshots ORDER BY taken_at DESC LIMIT 1"
+        ).fetchone()
+
+    def snapshot_skills(self, snapshot_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM static_skill_breakdowns WHERE snapshot_id=? "
+                "ORDER BY rank_in_index IS NULL, rank_in_index",
+                (snapshot_id,),
+            )
+        )
+
+    def snapshot_toolsets(self, snapshot_id: int) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM static_toolset_breakdowns WHERE snapshot_id=?",
+                (snapshot_id,),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Skill events
+    # ------------------------------------------------------------------
+
+    def insert_skill_event(
+        self,
+        *,
+        session_id: Optional[str],
+        task_id: Optional[str],
+        turn_id: Optional[str],
+        skill_name: str,
+        action: str,
+        detected_at: Optional[float] = None,
+        use_count: Optional[int] = None,
+        reused: Optional[bool] = None,
+        reuse_after_patch: Optional[bool] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> int:
+        with self._write_lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO skill_events (
+                    session_id, task_id, turn_id, skill_name, action,
+                    detected_at, use_count, reused, reuse_after_patch,
+                    metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    task_id,
+                    turn_id,
+                    skill_name,
+                    action,
+                    detected_at or time.time(),
+                    use_count,
+                    1 if reused else 0 if reused is not None else None,
+                    1 if reuse_after_patch else 0 if reuse_after_patch is not None else None,
+                    json.dumps(metadata) if metadata else None,
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid or 0
+
+    def skill_events_for_session(self, session_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM skill_events WHERE session_id=? "
+                "ORDER BY detected_at ASC",
+                (session_id,),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Context deltas
+    # ------------------------------------------------------------------
+
+    def insert_context_delta(self, row: dict[str, Any]) -> int:
+        with self._write_lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO context_deltas (
+                    session_id, previous_api_request_id, current_api_request_id,
+                    provider_delta_tokens, explained_tokens, unexplained_tokens,
+                    coverage, contributors_json, detected_at, confidence,
+                    metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["session_id"],
+                    row.get("previous_api_request_id"),
+                    row["current_api_request_id"],
+                    row.get("provider_delta_tokens"),
+                    row.get("explained_tokens"),
+                    row.get("unexplained_tokens"),
+                    row.get("coverage"),
+                    json.dumps(row.get("contributors"))
+                    if row.get("contributors") else None,
+                    row.get("detected_at") or time.time(),
+                    row.get("confidence"),
+                    json.dumps(row.get("metadata")) if row.get("metadata") else None,
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid or 0
+
+    def context_deltas_for_session(self, session_id: str) -> list[sqlite3.Row]:
+        return list(
+            self._conn.execute(
+                "SELECT * FROM context_deltas WHERE session_id=? "
+                "ORDER BY detected_at ASC",
+                (session_id,),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # App config
+    # ------------------------------------------------------------------
+
+    def get_app_config(self, key: str) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT value FROM app_config WHERE key=?", (key,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_app_config(self, key: str, value: str) -> None:
+        with self._write_lock:
+            self._conn.execute(
+                """
+                INSERT INTO app_config (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, value, time.time()),
+            )
+            self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Self-overhead samples
+    # ------------------------------------------------------------------
+
+    def record_self_overhead(self, callback_name: str, duration_ms: float) -> None:
+        with self._write_lock:
+            self._conn.execute(
+                "INSERT INTO self_overhead_samples (callback_name, duration_ms, sampled_at) "
+                "VALUES (?, ?, ?)",
+                (callback_name, duration_ms, time.time()),
+            )
+            self._conn.commit()
+
+    def self_overhead_summary(self, callback_name: Optional[str] = None,
+                              limit: int = 2000) -> dict[str, dict[str, float]]:
+        if callback_name:
+            rows = self._conn.execute(
+                "SELECT * FROM self_overhead_samples WHERE callback_name=? "
+                "ORDER BY sampled_at DESC LIMIT ?",
+                (callback_name, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM self_overhead_samples ORDER BY sampled_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        out: dict[str, list[float]] = {}
+        for r in rows:
+            out.setdefault(r["callback_name"], []).append(float(r["duration_ms"]))
+        summary: dict[str, dict[str, float]] = {}
+        for name, samples in out.items():
+            samples.sort()
+            summary[name] = {
+                "count": len(samples),
+                "avg_ms": sum(samples) / max(1, len(samples)),
+                "max_ms": samples[-1],
+                "p50_ms": _percentile(samples, 50.0),
+                "p95_ms": _percentile(samples, 95.0),
+            }
+        return summary
 
     # ------------------------------------------------------------------
     # Pricing
@@ -549,8 +852,9 @@ def _api_request_bind(row: dict[str, Any]) -> dict[str, Any]:
     defaults: dict[str, Any] = {k: None for k in _API_REQUEST_FIELDS}
     defaults.update({k: v for k, v in row.items() if k in _API_REQUEST_FIELDS})
     # SQLite wants ints as ints, not booleans
-    if defaults.get("streaming") is not None:
-        defaults["streaming"] = 1 if defaults["streaming"] else 0
+    for bool_key in ("streaming", "payload_truncated"):
+        if defaults.get(bool_key) is not None:
+            defaults[bool_key] = 1 if defaults[bool_key] else 0
     return defaults
 
 
@@ -559,7 +863,29 @@ def _tool_call_bind(row: dict[str, Any]) -> dict[str, Any]:
     defaults.update({k: v for k, v in row.items() if k in _TOOL_CALL_FIELDS})
     if defaults.get("output_truncated") is not None and isinstance(defaults["output_truncated"], bool):
         defaults["output_truncated"] = 1 if defaults["output_truncated"] else 0
+    if defaults.get("file_path_stored") is not None and isinstance(defaults["file_path_stored"], bool):
+        defaults["file_path_stored"] = 1 if defaults["file_path_stored"] else 0
     return defaults
+
+
+def _snapshot_bind(row: dict[str, Any]) -> dict[str, Any]:
+    defaults: dict[str, Any] = {k: None for k in _SNAPSHOT_FIELDS}
+    defaults.update({k: v for k, v in row.items() if k in _SNAPSHOT_FIELDS})
+    if defaults.get("hermes_native") is not None and isinstance(defaults["hermes_native"], bool):
+        defaults["hermes_native"] = 1 if defaults["hermes_native"] else 0
+    return defaults
+
+
+def _percentile(sorted_samples: list[float], pct: float) -> float:
+    if not sorted_samples:
+        return 0.0
+    if len(sorted_samples) == 1:
+        return sorted_samples[0]
+    k = (len(sorted_samples) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_samples) - 1)
+    frac = k - lo
+    return sorted_samples[lo] + (sorted_samples[hi] - sorted_samples[lo]) * frac
 
 
 _API_REQUEST_FIELDS = (
@@ -578,6 +904,10 @@ _API_REQUEST_FIELDS = (
     "raw_usage_json",
     "assistant_content_chars", "assistant_tool_call_count",
     "request_hash", "response_hash",
+    "prompt_visible_chars", "prompt_visible_provenance",
+    "prompt_visible_tokens_est", "prompt_visible_confidence",
+    "payload_truncated", "weight_cached", "weight_prompt",
+    "context_tier_snapshot_id",
     "metadata_json",
 )
 
@@ -590,6 +920,26 @@ _TOOL_CALL_FIELDS = (
     "input_chars", "input_tokens_est",
     "output_chars", "output_tokens_est",
     "output_hash", "args_hash", "args_summary", "metadata_json",
+    "command_family", "command_hash",
+    "input_measurement_method", "output_measurement_method",
+    "input_tokens", "args_keys_json",
+    "path_ext", "path_hash", "path_basename", "file_path_stored",
+)
+
+_SNAPSHOT_FIELDS = (
+    "taken_at", "hermes_version", "platform", "model", "base_url",
+    "system_prompt_chars", "system_prompt_bytes", "system_prompt_tokens_est",
+    "stable_chars", "stable_bytes", "stable_tokens_est",
+    "context_chars", "context_bytes", "context_tokens_est",
+    "volatile_chars", "volatile_bytes", "volatile_tokens_est",
+    "skills_index_chars", "skills_index_bytes", "skills_index_tokens_est",
+    "memory_chars", "memory_bytes", "memory_tokens_est",
+    "user_profile_chars", "user_profile_bytes", "user_profile_tokens_est",
+    "tools_count", "tools_json_bytes", "tools_json_tokens_est",
+    "mcp_schemas_chars", "mcp_schemas_bytes", "mcp_schemas_tokens_est",
+    "subagent_defs_chars", "subagent_defs_bytes", "subagent_defs_tokens_est",
+    "other_chars", "other_bytes", "other_tokens_est",
+    "tokenizer_method", "hermes_native", "metadata_json",
 )
 
 

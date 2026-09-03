@@ -20,6 +20,7 @@ from .attribution import (
     ComponentAttribution,
     classify_message_role,
     attribute_messages,
+    attribution_coverage,
     COMPONENT_ORDER,
 )
 from .pricing import (
@@ -47,6 +48,7 @@ __all__ = [
     "ComponentAttribution",
     "classify_message_role",
     "attribute_messages",
+    "attribution_coverage",
     "COMPONENT_ORDER",
     "PricingTable",
     "PricingEntry",
