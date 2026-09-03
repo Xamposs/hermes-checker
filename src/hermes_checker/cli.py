@@ -101,6 +101,31 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze = sub.add_parser("analyze", help="Run the analyzer on a session.")
     analyze.add_argument("--session", required=True)
 
+    snapshot = sub.add_parser(
+        "snapshot",
+        help=(
+            "Capture the static prompt overhead once (Issue 6). "
+            "Uses Hermes's offline prompt_size.compute_prompt_breakdown "
+            "and persists a snapshot to the database. NOT executed on "
+            "every API hook."
+        ),
+    )
+    snapshot.add_argument(
+        "--platform", default="cli",
+        help="Hermes platform name (default: cli). "
+             "Matches Hermes' built-in `hermes prompt-size` flag.",
+    )
+
+    experiment = sub.add_parser(
+        "experiment",
+        help="Get/set/clear the persistent experiment label.",
+    )
+    experiment_sub = experiment.add_subparsers(dest="experiment_command")
+    exp_set = experiment_sub.add_parser("set", help="Set the current experiment label.")
+    exp_set.add_argument("name", help="e.g. baseline-minimax-direct")
+    experiment_sub.add_parser("show", help="Show the current experiment label.")
+    experiment_sub.add_parser("clear", help="Clear the experiment label.")
+
     return p
 
 
@@ -246,6 +271,51 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_snapshot(args: argparse.Namespace) -> int:
+    """Capture a static prompt overhead snapshot (Issue 6)."""
+    db = _open_database(args)
+    paths = db.paths
+    db.close()
+    from hermes_checker.snapshot import run_snapshot, render_breakdown_text
+    sid, breakdown = run_snapshot(platform=args.platform, paths=paths)
+    print(render_breakdown_text(breakdown))
+    print(f"persisted: snapshot id={sid}")
+    return 0
+
+
+def _cmd_experiment(args: argparse.Namespace) -> int:
+    """Get/set/clear the persistent experiment label."""
+    db = _open_database(args)
+    paths = db.paths
+    db.close()
+    if args.experiment_command == "set":
+        db2 = _open_database(args)
+        try:
+            db2.set_app_config("experiment", args.name)
+        finally:
+            db2.close()
+        print(f"experiment = {args.name!r}")
+        return 0
+    if args.experiment_command == "clear":
+        # We use an upsert-via-NULL sentinel: setting to empty string is
+        # our convention for "no experiment".
+        db2 = _open_database(args)
+        try:
+            db2.set_app_config("experiment", "")
+        finally:
+            db2.close()
+        print("experiment cleared")
+        return 0
+    # default: show
+    db2 = _open_database(args)
+    try:
+        v = db2.get_app_config("experiment")
+    finally:
+        db2.close()
+    print(f"experiment = {v!r}" if v else "no experiment set")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -278,6 +348,8 @@ _HANDLERS = {
     "install": _cmd_install,
     "uninstall": _cmd_uninstall,
     "analyze": _cmd_analyze,
+    "snapshot": _cmd_snapshot,
+    "experiment": _cmd_experiment,
 }
 
 
